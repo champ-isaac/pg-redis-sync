@@ -1,0 +1,65 @@
+# Topology 2: one main (primary) PostgreSQL plus one read replica.
+# Layer it over the base file; the single-instance setup stays the default.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.replica.yaml up -d --wait
+#   docker compose -f docker-compose.yaml -f docker-compose.replica.yaml run --rm app go test ./...
+#   docker compose -f docker-compose.yaml -f docker-compose.replica.yaml down      # -v deletes volumes
+#
+# The main instance stays the service named `postgres`: it holds the slot and
+# is the only CDC source. `postgres-replica` is a physical streaming replica
+# of it, used for read-only queries. Local development only.
+name: pg-redis-sync
+
+services:
+  postgres:
+    # Same as the base file, plus a pg_hba.conf that allows replication
+    # connections from other containers. hba_file lives outside the data
+    # directory, so this also works on a volume created before this file existed.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    volumes:
+      - ./docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+
+  postgres-replica:
+    image: postgres:17-alpine
+    user: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: sync_local_only
+      PGUSER: sync
+      PGDATABASE: pgredissync
+    ports:
+      - "127.0.0.1:${PG_REPLICA_PORT:-5433}:5432"
+    volumes:
+      - pgreplicadata:/var/lib/postgresql/data
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          # Free the physical slot if an earlier replica volume was deleted but the main one was kept.
+          psql -h postgres -Atc "select pg_drop_replication_slot('replica_1') from pg_replication_slots where slot_name = 'replica_1' and not active"
+          # -R writes standby.signal and primary_conninfo; -C -S creates and uses a physical slot.
+          pg_basebackup -h postgres -D "$$PGDATA" -X stream -R -C -S replica_1
+          chmod 700 "$$PGDATA"
+        fi
+        exec postgres -c hot_standby=on -c hot_standby_feedback=on
+    healthcheck:
+      # Accepts connections and really is a standby.
+      test: ["CMD-SHELL", "psql -Atc 'select pg_is_in_recovery()' | grep -qx t"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  app:
+    environment:
+      PG_TOPOLOGY: primary_replica
+      PG_REPLICA_DSNS: postgres://sync:sync_local_only@postgres-replica:5432/pgredissync?sslmode=disable
+    depends_on:
+      postgres-replica:
+        condition: service_healthy
+
+volumes:
+  pgreplicadata:

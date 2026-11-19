@@ -3,7 +3,7 @@
 Stream row-level changes from PostgreSQL into Redis, using logical replication (CDC).
 Ships as a Go library (`pgsync`) and a ready-to-run binary (`cmd/pg-redis-sync`).
 
-> **Status: design only.** No code exists yet. This README is the design, architecture and plan.
+> **Status: early.** Implemented so far: configuration loading and validation for both PostgreSQL topologies, connection-string handling, read-source selection (`pgsync/`), and the local docker-compose setups. Replication, decoding and the Redis sink are still design only. This README is the design, architecture and plan.
 
 ## Contents
 
@@ -18,11 +18,11 @@ Ships as a Go library (`pgsync`) and a ready-to-run binary (`cmd/pg-redis-sync`)
 
 ## 1. Assumptions to confirm
 
-You gave three assumptions. All three are workable. I used them as written. Here is what each one means and what changes if it is wrong.
+Here is what each assumption means and what changes if it is wrong.
 
 | Assumption | Used as | If wrong |
 |---|---|---|
-| Single PostgreSQL database | One slot, one publication, one replication connection per process. | Several databases = run several processes (one config each). Fan-in inside one process is a later, optional step. |
+| One source database per process, on one of two **topologies** chosen by config: `single` (one PostgreSQL instance) or `primary_replica` (one main instance plus read replicas). See 2.3. | One slot, one publication, one replication connection per process. The slot always lives on the main instance. | Several databases = run several processes (one config each). Fan-in inside one process is a later, optional step. |
 | Row-level changes only, no DDL | Handle `INSERT`, `UPDATE`, `DELETE` (and `TRUNCATE`, see 2.4). Logical decoding never emits DDL anyway. | Schema-change replication would need event triggers or a separate DDL feed. Out of scope. We only *tolerate* additive column changes (see 2.4). |
 | Library plus runnable binary | Public package `pgsync` holds all logic. `cmd/pg-redis-sync` is a thin wrapper (YAML config, signals, metrics). | Library-only: drop `cmd/`. Binary-only: make everything `internal/`. |
 
@@ -33,8 +33,12 @@ Further assumptions I made (please confirm or correct):
 - **Go 1.23+**, `jackc/pgx/v5` + `jackc/pglogrepl` for replication, `redis/go-redis/v9` for Redis, stdlib `log/slog` for logs.
 - **Module path** is `github.com/champ-isaac/pg-redis-sync`, matching the git remote.
 - **Local dev credentials** (docker-compose only, not secrets): Postgres user `sync`, database `pgredissync`.
+- **Redis is a cache/derived view.** Postgres stays the source of truth. If Redis loses data, we rebuild it from a snapshot (milestone 6).
+- **Replicas are read sources, the main instance is the authoritative source for sync.** The CDC stream never comes from a replica in v1 (see 2.3).
 
 ### Local development
+
+Single instance (the default):
 
 ```sh
 docker compose up -d --wait               # postgres (wal_level=logical), redis, app container
@@ -42,8 +46,19 @@ docker compose run --rm app go test ./... # unit tests, no live databases needed
 docker compose down                       # add -v to also delete the volumes
 ```
 
-The `app` container gets `PG_DSN` and `REDIS_ADDR`. Postgres and Redis are published on `127.0.0.1:5432` and `127.0.0.1:6379`. Override with `PG_PORT` and `REDIS_PORT` if those ports are taken.
-- **Redis is a cache/derived view.** Postgres stays the source of truth. If Redis loses data, we rebuild it from a snapshot (milestone 6).
+Main plus one read replica. Layer the second file over the first:
+
+```sh
+export COMPOSE_FILE=docker-compose.yaml:docker-compose.replica.yaml
+docker compose up -d --wait               # + postgres-replica (streaming replica of postgres)
+docker compose run --rm app go test ./... # app runs with PG_TOPOLOGY=primary_replica
+docker compose down                       # add -v to also delete the volumes
+unset COMPOSE_FILE                        # back to the single-instance setup
+```
+
+In both setups `postgres` is the main instance and holds the slot. The `app` container gets `PG_DSN` and `REDIS_ADDR`; with the replica file it also gets `PG_TOPOLOGY` and `PG_REPLICA_DSNS`. Ports on `127.0.0.1`: Postgres `5432`, Redis `6379`, replica `5433`. Override with `PG_PORT`, `REDIS_PORT`, `PG_REPLICA_PORT` if they are taken.
+
+To go back from the replica setup to single, `docker compose down` (or `rm -sfv postgres-replica`), then drop the leftover physical slot on the main instance: `select pg_drop_replication_slot('replica_1')`. An inactive slot makes the main instance keep WAL forever. `down -v` avoids this by deleting the volumes.
 
 ---
 
@@ -57,11 +72,13 @@ The `app` container gets `PG_DSN` and `REDIS_ADDR`. Postgres and Redis are publi
 - **Safe to replay.** A change applied twice leaves Redis in the same state.
 - Simple operations: one binary, one config file, clear metrics, clear failure modes.
 - Usable as a library, with the Redis side pluggable (custom mapper or custom sink).
+- Run against **either** a single PostgreSQL instance **or** a main instance with read replicas, selected by configuration, without changing the sync behaviour.
 
 ### 2.2 Non-goals
 
 - DDL replication or automatic schema migration.
 - Multiple source databases in one process.
+- Streaming the CDC feed from a replica, and automatic failover or promotion handling (see 2.3, "Topologies").
 - Redis Cluster, and fan-out to several Redis targets (v1).
 - Secondary indexes, joins or derived/aggregated keys. One row maps to one key.
 - Exactly-once across two systems. We get *at-least-once delivery with idempotent writes*, which is the practical equivalent (see 3.3).
@@ -121,6 +138,48 @@ This means the consumer never sees aborted transactions and never has to reorder
 - Logical slots are not carried over on a physical failover before PostgreSQL 17 (failover slots). After a failover the operator re-creates the slot and re-snapshots.
 - Sequences and large objects are not replicated by logical replication.
 
+#### Topologies
+
+The sync runs against one of two PostgreSQL topologies, chosen with `postgres.topology`. Everything outside the table below (decoding, Redis mapping, checkpoints, delivery guarantees) is identical.
+
+| | `single` (default) | `primary_replica` |
+|---|---|---|
+| Instances | one | one **main** (primary) plus one or more read replicas of it |
+| Config | `dsn` | `dsn` (the main instance) and `replicas` (list of DSNs, in order of preference) |
+| CDC stream (slot, publication, `START_REPLICATION`) | the instance | **main only** |
+| Preflight (`wal_level`, slot, publication, replica identity) | the instance | main. Also: the main must **not** be in recovery. Each replica must be reachable, in recovery, and on the same database |
+| Read-only queries (backfill reads, reconciliation, lag checks) | the instance | the first healthy replica, else the main (see `read_fallback`) |
+
+The `single` topology is exactly the behaviour from before topologies existed: with only `dsn` set, nothing changes.
+
+**Why the main instance is the only CDC source.**
+- It is the authoritative write source. The slot, its `confirmed_flush_lsn` and the publication all live on one writable node, so there is one clear position to resume from.
+- Before PostgreSQL 16 a logical slot cannot be created on a standby at all. From 16 it can, but it needs extra setup (`hot_standby_feedback`, primary `wal_level=logical`) and the slot is not failover-safe before 17. Streaming from a standby is therefore a later opt-in (milestone 7), not v1.
+
+**Replica selection (read-only queries).** In `primary_replica`, the first replica in configured order is used if it is:
+1. reachable,
+2. in recovery (a server that is *not* a standby is a wrong DSN or a promoted replica, and is never used), and
+3. lagging the main instance by at most `replica_max_lag_bytes` (WAL bytes; default 64 MiB).
+
+If none qualifies: `read_fallback: primary` (default) reads from the main instance, `read_fallback: none` returns an error (`ErrNoReadSource`). The reasons replicas were skipped are returned so they can be logged. Selection is re-evaluated each time a read connection is needed, so a recovered replica is picked up again.
+
+**Config validation** (at startup, before any connection): `replicas` is only allowed with `primary_replica`, and is an error with `single` (it is never silently ignored). `primary_replica` needs at least one replica. Each replica must be a different instance than the main (`host:port`), use the same database name, and appear only once. `replica_max_lag_bytes` must be above 0.
+
+**What replicas are for.**
+- **Backfill reads (milestone 6).** Copying whole tables loads the database, so it can run on a replica. The slot's exported snapshot only exists on the main instance, so a replica cannot use it. The safe procedure is:
+  1. create the slot on the main instance and note its `consistent_point` LSN,
+  2. wait until the replica has replayed past that LSN (`pg_last_wal_replay_lsn() >= consistent_point`),
+  3. copy the tables in a `REPEATABLE READ` transaction on the replica,
+  4. stream from `consistent_point`.
+
+  Rows read in step 3 may already include changes newer than `consistent_point`. The stream then replays those older changes on top. Writes are state-based and applied in commit order, so Redis still ends at the correct state; a key can briefly show an older value on the way (the same caveat as in 3.3).
+- **Reconciliation and verification** (compare Redis against PostgreSQL) and **lag checks**.
+- Replicas are **never written to** and never hold the slot.
+
+**Requirements for replicas:** physical streaming replication from the main instance, `hot_standby = on`, the same major version, and a role that can run `pg_is_in_recovery()` and `pg_last_wal_replay_lsn()`. `hot_standby_feedback = on` is recommended for long backfill reads, so replay conflicts do not cancel them.
+
+**Failover and promotion (not automated in v1).** If the main instance is lost and a replica is promoted, the logical slot is not on it (it is only carried over with PostgreSQL 17 failover slots). The operator points `postgres.dsn` at the new main instance, removes it from `replicas`, creates the slot and re-snapshots (milestone 6). If `dsn` points at a server that is in recovery, preflight fails with a clear error instead of trying to stream from it.
+
 ### 2.4 Redis side
 
 **Keys.** One PostgreSQL row = one Redis key. The key comes from a per-table template built from primary-key (replica-identity) columns:
@@ -169,11 +228,12 @@ Details that matter:
 ### 3.1 Components and data flow
 
 ```
-                         PostgreSQL
-              ┌──────────────────────────────┐
-              │ WAL → pgoutput → slot        │
-              └──────────────┬───────────────┘
-                             │ replication protocol (1 connection)
+         PostgreSQL main (the only CDC source, both topologies)
+              ┌──────────────────────────────┐        ┌──────────────────┐
+              │ WAL → pgoutput → slot        │ ─ ─ ─▶ │ read replicas    │  primary_replica only:
+              └──────────────┬───────────────┘ physical│ (read-only       │  reads for backfill,
+                             │ replication protocol    │  queries only)   │  reconciliation, lag
+                             │ (1 connection)          └──────────────────┘
  ┌───────────────────────────▼────────────────────────────────────────┐
  │ pg-redis-sync                                                      │
  │                                                                    │
@@ -206,6 +266,7 @@ Details that matter:
 | **Applier** | Groups changes into batches (by count, bytes or time), calls the sink, retries on error, then advances `flushedLSN`. This is the only place that decides when it is safe to ack. |
 | **Redis sink** | Maps each `Change` to Redis commands (`Mapper`), runs them as one `MULTI/EXEC` pipeline together with the checkpoint write. |
 | **Checkpoint store** | Records the last fully applied commit LSN. Default implementation lives in Redis (atomic with the data). Read once at startup. |
+| **Source selector** | Decides which PostgreSQL server each connection goes to, from the configured topology (2.3). `StreamDSN` always returns the main instance. `SelectReadSource` returns the first healthy replica (or the main instance) for read-only queries. In `single` it just returns the one instance. Implemented in `pgsync/source.go`. |
 
 **Concurrency model.** Two goroutines joined by a bounded channel: receiver/decoder → applier. When Redis is slow the channel fills, the decoder stops reading from the socket, and Postgres buffers WAL on its side. The receiver keeps sending keepalives the whole time, so a slow Redis never causes a replication timeout.
 
@@ -266,7 +327,9 @@ Consistency seen by Redis readers: **eventually consistent.** Changes from one t
 pg-redis-sync/
 ├── cmd/
 │   └── pg-redis-sync/        main.go: flags, YAML config, signals, /healthz, /metrics
-├── pgsync/                   PUBLIC. Syncer, Config, Run(ctx). Wires the parts together.
+├── pgsync/                   PUBLIC. Syncer, Run(ctx). Wires the parts together.
+│   ├── config.go             (done) Config, topologies, env loading, validation, DSN helpers
+│   └── source.go             (done) StreamDSN, SelectReadSource, Prober
 ├── change/                   PUBLIC. Change, Op, Row, LSN types (no deps; shared by sinks)
 ├── sink/
 │   └── redis/                PUBLIC. Sink, Mapper (hash, json), checkpoint store, Lua/pipeline helpers
@@ -276,7 +339,10 @@ pg-redis-sync/
 │   ├── apply/                batching, retry/backoff, ack watermark
 │   └── testutil/             docker-compose / testcontainers helpers, fake stream
 ├── config.example.yaml
-├── docker-compose.yml        postgres (wal_level=logical) + redis, for dev and integration tests
+├── docker-compose.yaml       single topology: postgres (wal_level=logical) + redis + app, for dev
+├── docker-compose.replica.yaml  override: adds postgres-replica, switches app to primary_replica
+├── docker/postgres/pg_hba.conf  lets the replica open replication connections (dev only)
+├── Dockerfile                dev image (Go 1.26)
 ├── go.mod
 └── README.md
 ```
@@ -319,7 +385,34 @@ type Stream interface {
 }
 
 type Preflight interface {
-    Check(ctx context.Context) error // wal_level, slot, publication, replica identity, key templates
+    // wal_level, slot, publication, replica identity, key templates; the main
+    // instance is not in recovery; with primary_replica, each replica is a standby.
+    Check(ctx context.Context) error
+}
+```
+
+```go
+// pgsync — topology and source selection (implemented).
+type Topology string // TopologySingle (default) | TopologyPrimaryReplica
+
+func (p Postgres) StreamDSN() (string, error) // the main instance + replication=database, in every topology
+func (p Postgres) SelectReadSource(ctx context.Context, pr Prober) (ReadSource, error)
+
+// Prober inspects one replica. A pgx implementation arrives with milestone 1;
+// tests use a fake, so selection logic needs no database.
+type Prober interface {
+    ProbeReplica(ctx context.Context, dsn string) (ReplicaStatus, error)
+}
+
+type ReplicaStatus struct {
+    InRecovery bool  // false = not a standby: wrong DSN or promoted; never used
+    LagBytes   int64 // main WAL position minus replica replay position
+}
+
+type ReadSource struct {
+    DSN     string
+    Role    Role     // RolePrimary | RoleReplica
+    Skipped []string // replicas that were rejected and why (passwords redacted)
 }
 ```
 
@@ -359,7 +452,13 @@ YAML for the binary, plus a matching `pgsync.Config` struct for library users. S
 
 ```yaml
 postgres:
-  dsn: ${PG_DSN}                 # postgres://user:pass@host:5432/db ; replication=database is added for you
+  topology: single               # single | primary_replica
+  dsn: ${PG_DSN}                 # the main (primary) instance: postgres://user:pass@host:5432/db
+                                 # replication=database is added for you. Slot and CDC stream use this.
+  replicas: []                   # primary_replica only. Read replicas of dsn, in order of preference:
+                                 #   - ${PG_REPLICA_1_DSN}
+  replica_max_lag_bytes: 67108864  # primary_replica only: skip a replica that trails the main by more (64 MiB)
+  read_fallback: primary         # primary | none. When no replica qualifies for a read.
   slot: pg_redis_sync
   publication: pg_redis_sync_pub
   create_slot: true
@@ -397,7 +496,21 @@ http:
   addr: ":9090"                  # /healthz, /metrics
 ```
 
-Everything has a default except `postgres.dsn`, `redis.addr` and `tables`. Config is validated at startup. Unknown fields are an error.
+Everything has a default except `postgres.dsn`, `redis.addr` and `tables`. With `topology: primary_replica`, `replicas` is also required. Config is validated at startup. Unknown fields are an error.
+
+**Environment variables** (what `pgsync.LoadFromEnv` reads today, before the YAML loader exists):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `PG_TOPOLOGY` | `single` or `primary_replica` | `single` |
+| `PG_DSN` | main (primary) instance | required |
+| `PG_REPLICA_DSNS` | comma-separated replica DSNs (percent-encode a comma inside a password) | none; required for `primary_replica`, an error for `single` |
+| `PG_REPLICA_MAX_LAG_BYTES` | largest accepted replica lag | `67108864` |
+| `PG_READ_FALLBACK` | `primary` or `none` | `primary` |
+| `PG_SLOT`, `PG_PUBLICATION` | slot and publication names | `pg_redis_sync`, `pg_redis_sync_pub` |
+| `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Redis connection | `REDIS_ADDR` required |
+
+Existing single-instance setups need no change: `PG_DSN` and `REDIS_ADDR` alone still select `single`.
 
 ### 4.4 Error handling and retries
 
@@ -410,6 +523,8 @@ Everything has a default except `postgres.dsn`, `redis.addr` and `tables`. Confi
 | Unknown relation, undecodable tuple, unsupported type | permanent | Halt. Return an error from `Run`. Process exits non-zero. |
 | Key template references non-identity column; PK change in `Relation` | permanent | Halt (also caught in preflight where possible). |
 | Redis checkpoint behind slot position | permanent | Halt (`on_gap: fail`). |
+| `dsn` points at a server in recovery (a replica, or a failed-over main) | permanent | Halt in preflight with a clear error. Never stream from it. |
+| A replica is down, lagging or not a standby | transient | Not an error. Skip it and use the next one, then the main instance (`read_fallback`). Only `read_fallback: none` turns this into an error (`ErrNoReadSource`). The CDC stream is unaffected, because it never uses a replica. |
 | `ctx` cancelled / SIGTERM | shutdown | Stop reading, finish and ack the in-flight batch (bounded by a shutdown timeout), close connections, return `nil`. |
 
 Principles:
@@ -423,7 +538,7 @@ Principles:
 ### 4.5 Testing approach
 
 - **Unit:** decoder against recorded `pgoutput` byte fixtures (insert, update with key change, delete, TOAST, truncate, relation change). Mapper as table-driven tests (Change in, commands out). Applier with a fake `Stream` and fake `Sink` (retry, ack order).
-- **Integration:** real Postgres + Redis via docker-compose / testcontainers. Check end-to-end content equality after random workloads.
+- **Integration:** real Postgres + Redis via docker-compose / testcontainers. Check end-to-end content equality after random workloads. Run the suite against **both** topologies: `docker-compose.yaml` alone (single) and with `docker-compose.replica.yaml` (main plus replica). In the replica run, also stop the replica mid-test and check the sync keeps streaming from the main instance.
 - **Fault injection:** kill the process after `EXEC` but before ack, and before `EXEC`. Drop the Redis connection mid-batch. Restart Postgres. After each, assert Redis equals Postgres and no data was lost.
 - **Soak:** sustained write load with periodic restarts, watching lag and memory.
 
@@ -435,20 +550,20 @@ Each milestone ends in something runnable and testable.
 
 | # | Milestone | Done when |
 |---|---|---|
-| **0** | **Scaffold & preflight.** `go.mod`, CI (vet, test, lint), docker-compose, config loading/validation, `Preflight` checks. | `pg-redis-sync check` reports clear pass/fail for `wal_level`, slot, publication, replica identity. |
+| **0** | **Scaffold & preflight.** `go.mod`, CI (vet, test, lint), docker-compose (single and main+replica), config loading/validation for both topologies, read-source selection (**done**), `Preflight` checks (open). | `pg-redis-sync check` reports clear pass/fail for `wal_level`, slot, publication, replica identity, main not in recovery, and each replica being a standby. |
 | **1** | **Replication consumer.** Connect, create/verify slot, `START_REPLICATION`, keepalives, status updates. Print raw messages. | Insert in Postgres shows up as a logged message. Restart resumes from the confirmed LSN, with no loss and no endless replay. |
 | **2** | **Decoder & change model.** Relation cache, `Change` / `Batch` types, type conversion, TOAST markers, transaction boundaries. | Recorded-fixture unit tests pass. Live changes print as typed `Change` values. |
 | **3** | **Redis sink, hash mode.** Mapper, `MULTI/EXEC` batches, atomic checkpoint, key templates, delete/update/key-change, TRUNCATE. Applier with ack-after-commit. | End-to-end sync works. Content equality test passes under random workload. |
 | **4** | **Reliability.** Retry/backoff, reconnect, standby behaviour, graceful shutdown, gap detection, idle LSN advance. | Fault-injection suite passes (kill points, Redis/Postgres restarts). |
 | **5** | **Binary & operations.** YAML config, `slog`, Prometheus metrics, `/healthz`, Dockerfile, example config, user docs. | Runs from a container with only config + env. Lag and halt state visible in metrics. **v0.1.0 release.** |
-| **6** | **Rebuild & JSON mode.** Initial snapshot/backfill: create slot with `EXPORT_SNAPSHOT`, copy tables in a `REPEATABLE READ` transaction using that snapshot, then stream from the slot's consistent point. Add `json` value type. | Empty Redis can be rebuilt from Postgres with no gap and no duplicates. Used also to recover from a detected gap. |
-| **7** | **Later, only if needed.** `pgoutput` v2 streaming of in-progress large transactions, parallel apply by key hash with a low-watermark ack, Redis Cluster, dead-letter sink, per-key LSN guard, Redis Streams sink. | Each item is justified by a measured need first. |
+| **6** | **Rebuild & JSON mode.** Initial snapshot/backfill. `single`: create slot with `EXPORT_SNAPSHOT`, copy tables in a `REPEATABLE READ` transaction using that snapshot, then stream from the slot's consistent point. `primary_replica`: copy from a replica after it has replayed past the slot's consistent point (2.3). Add `json` value type. | Empty Redis can be rebuilt from Postgres with no gap and no duplicates. Used also to recover from a detected gap. |
+| **7** | **Later, only if needed.** `pgoutput` v2 streaming of in-progress large transactions, parallel apply by key hash with a low-watermark ack, Redis Cluster, dead-letter sink, per-key LSN guard, Redis Streams sink, CDC from a standby (PostgreSQL 16+, opt-in `stream_from: replica`), automated failover handling. | Each item is justified by a measured need first. |
 
 ---
 
 ## 6. Open questions
 
-1. Is the placeholder module path correct, or what is the real GitHub owner/name?
+1. Which PostgreSQL topology do you run in production: a single instance, or a main with replicas? In the replica case, what are the replicas for: backfill reads, reconciliation, or do you want the CDC feed taken from a standby (milestone 7, PostgreSQL 16+)?
 2. Which Redis topology do you run (standalone, Sentinel, Cluster)? Cluster changes the checkpoint design (3.3).
 3. Do you prefer `hash` or `json` as the main value type? This decides which one is built first (currently `hash`).
 4. Are the tables you sync all primary-keyed? Tables with no PK need `REPLICA IDENTITY FULL` or a unique index.
