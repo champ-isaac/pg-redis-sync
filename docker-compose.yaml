@@ -1,0 +1,66 @@
+# Local development only. The password below is not a secret.
+#   docker compose up -d
+#   docker compose run --rm app go test ./...
+name: pg-redis-sync
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    # wal_level=logical is required for logical replication (README 2.3).
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: sync
+      POSTGRES_PASSWORD: sync_local_only
+      POSTGRES_DB: pgredissync
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sync -d pgredissync"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    # Idle dev container: run commands with `docker compose run --rm app <cmd>`.
+    command: ["sleep", "infinity"]
+    environment:
+      PG_DSN: postgres://sync:sync_local_only@postgres:5432/pgredissync?sslmode=disable
+      REDIS_ADDR: redis:6379
+    volumes:
+      - .:/src
+      - gomodcache:/go/pkg/mod
+      - gobuildcache:/root/.cache/go-build
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # The mounted source is visible and the toolchain works.
+      test: ["CMD-SHELL", "test -f /src/go.mod && go version"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:
+  redisdata:
+  gomodcache:
+  gobuildcache:
