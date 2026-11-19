@@ -31,7 +31,7 @@ Further assumptions I made (please confirm or correct):
 - **PostgreSQL 13+** (14+ recommended), built-in `pgoutput` plugin. Not `wal2json`/`decoderbufs`, because `pgoutput` needs no server extension and is available on every managed service.
 - **Redis standalone or Sentinel** in v1. Redis Cluster is deferred (see 2.3: the atomic checkpoint needs all keys in one transaction).
 - **Go 1.23+**, `jackc/pgx/v5` + `jackc/pglogrepl` for replication, `redis/go-redis/v9` for Redis, stdlib `log/slog` for logs.
-- **Module path** is `github.com/isaac/pg-redis-sync`. The git remote is `github.com/champ-isaac/pg-redis-sync`, so change the module path if you want `go get` to work against it.
+- **Module path** is `github.com/champ-isaac/pg-redis-sync`, matching the git remote.
 - **Local dev credentials** (docker-compose only, not secrets): Postgres user `sync`, database `pgredissync`.
 
 ### Local development
