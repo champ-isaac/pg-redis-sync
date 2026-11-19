@@ -31,7 +31,18 @@ Further assumptions I made (please confirm or correct):
 - **PostgreSQL 13+** (14+ recommended), built-in `pgoutput` plugin. Not `wal2json`/`decoderbufs`, because `pgoutput` needs no server extension and is available on every managed service.
 - **Redis standalone or Sentinel** in v1. Redis Cluster is deferred (see 2.3: the atomic checkpoint needs all keys in one transaction).
 - **Go 1.23+**, `jackc/pgx/v5` + `jackc/pglogrepl` for replication, `redis/go-redis/v9` for Redis, stdlib `log/slog` for logs.
-- **Module path** is a placeholder: `github.com/OWNER/pg-redis-sync`. Replace `OWNER` before the first commit.
+- **Module path** is `github.com/isaac/pg-redis-sync`. The git remote is `github.com/champ-isaac/pg-redis-sync`, so change the module path if you want `go get` to work against it.
+- **Local dev credentials** (docker-compose only, not secrets): Postgres user `sync`, database `pgredissync`.
+
+### Local development
+
+```sh
+docker compose up -d --wait               # postgres (wal_level=logical), redis, app container
+docker compose run --rm app go test ./... # unit tests, no live databases needed
+docker compose down                       # add -v to also delete the volumes
+```
+
+The `app` container gets `PG_DSN` and `REDIS_ADDR`. Postgres and Redis are published on `127.0.0.1:5432` and `127.0.0.1:6379`. Override with `PG_PORT` and `REDIS_PORT` if those ports are taken.
 - **Redis is a cache/derived view.** Postgres stays the source of truth. If Redis loses data, we rebuild it from a snapshot (milestone 6).
 
 ---
