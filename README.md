@@ -124,7 +124,7 @@ This means the consumer never sees aborted transactions and never has to reorder
 2. We tell Postgres how far we are done with *Standby Status Update* messages (flush LSN). We send this LSN **only after the Redis write for that transaction is committed** (see 3.2).
 3. After a crash, Postgres re-sends everything after the last confirmed LSN. Some of it may already be in Redis. Section 3.3 explains why that is harmless.
 4. Keepalives: the server sends `PrimaryKeepalive` and may set `ReplyRequested`. We must answer quickly or the server drops us (`wal_sender_timeout`, 60 s by default). The receive loop therefore never blocks on Redis (see 3.1).
-5. Idle advance: if all received transactions are applied and the server's WAL end is ahead (changes on tables we do not publish), we confirm the WAL end. Otherwise the slot holds WAL forever on a quiet table.
+5. Idle advance: if all received transactions are applied and the server's WAL end is ahead (changes on tables we do not publish), we confirm the WAL end. Otherwise the slot holds WAL forever on a quiet table. The order is the same as for data: we **first write that WAL end as the checkpoint to Redis, then acknowledge it to Postgres**. Without the Redis write, the slot would be ahead of the checkpoint after a restart, and the gap check in 3.3 would halt a healthy sync.
 
 **Replica identity** (what Postgres sends about the *old* row on UPDATE/DELETE):
 
@@ -138,7 +138,7 @@ This means the consumer never sees aborted transactions and never has to reorder
 **Other limits (documented, not solved):**
 
 - One active consumer per slot. A second instance gets "slot is active" and retries. This gives simple active/standby HA.
-- Logical slots are not carried over on a physical failover before PostgreSQL 17 (failover slots). After a failover the operator re-creates the slot and re-snapshots.
+- Logical slots are not carried over on a physical failover before PostgreSQL 17 (failover slots). After a failover the operator re-creates the slot and re-snapshots. The rebuild clears the old Redis keys and checkpoint first (3.5).
 - Sequences and large objects are not replicated by logical replication.
 
 #### Topologies
@@ -150,7 +150,7 @@ The sync runs against one of two PostgreSQL topologies, chosen with `postgres.to
 | Instances | one | one **main** (primary) plus one or more read replicas of it |
 | Config | `dsn` | `dsn` (the main instance) and `replicas` (list of DSNs, in order of preference) |
 | CDC stream (slot, publication, `START_REPLICATION`) | the instance | **main only** |
-| Preflight (`wal_level`, slot, publication, replica identity) | the instance | main. Also: the main must **not** be in recovery. Each replica must be reachable, in recovery, and on the same database |
+| Preflight (`wal_level`, slot, publication, replica identity) | the instance | main. Also: the main must **not** be in recovery. Each replica must be reachable, in recovery, on the same database and in the same cluster (same `system_identifier`, see below) |
 | Read-only queries (backfill reads, reconciliation, lag checks) | the instance | the first healthy replica, else the main (see `read_fallback`) |
 
 The `single` topology is exactly the behaviour from before topologies existed: with only `dsn` set, nothing changes.
@@ -161,8 +161,11 @@ The `single` topology is exactly the behaviour from before topologies existed: w
 
 **Replica selection (read-only queries).** In `primary_replica`, the first replica in configured order is used if it is:
 1. reachable,
-2. in recovery (a server that is *not* a standby is a wrong DSN or a promoted replica, and is never used), and
-3. lagging the main instance by at most `replica_max_lag_bytes` (WAL bytes; default 64 MiB).
+2. in recovery (a server that is *not* a standby is a wrong DSN or a promoted replica, and is never used),
+3. streaming from the main instance (`pg_stat_wal_receiver.status = 'streaming'`), and
+4. lagging the main instance by at most `replica_max_lag_bytes` (WAL bytes; default 64 MiB).
+
+**How lag is measured.** Lag is the **main instance's current WAL position minus the replica's replay position** (`pg_last_wal_replay_lsn()`). The caller reads `pg_current_wal_lsn()` on the main instance and passes it to the prober, because a replica cannot know it: a replica that lost its upstream only sees its own received position, so it could report lag 0 while it is arbitrarily stale. With the main position passed in, such a replica shows growing lag and is skipped. Not yet in `pgsync/source.go`: the current `Prober` takes only the replica DSN (see 4.2). Changing it is part of milestone 1.
 
 If none qualifies: `read_fallback: primary` (default) reads from the main instance, `read_fallback: none` returns an error (`ErrNoReadSource`). The reasons replicas were skipped are returned so they can be logged. Selection is re-evaluated each time a read connection is needed, so a recovered replica is picked up again.
 
@@ -174,10 +177,12 @@ Rules that the implementation (`pgsync/source.go`) follows:
 
 **Config validation** (at startup, before any connection): `replicas` is only allowed with `primary_replica`, and is an error with `single` (it is never silently ignored). `primary_replica` needs at least one replica. Each replica must be a different instance than the main (`host:port`), use the same database name, and appear only once. `replica_max_lag_bytes` must be above 0.
 
+**Cluster identity (preflight).** A matching database name does not prove that a replica belongs to the main instance. Preflight reads `system_identifier` from each replica (`SELECT system_identifier FROM pg_control_system()`) and from the main instance (`IDENTIFY_SYSTEM`, the same value as for the checkpoint, see 2.4). If they differ, preflight fails with a clear error naming the replica (without its DSN password). A physical replica always has the same identifier as its main. Without this check, a standby of another cluster would pass validation, and the replay comparison in the backfill procedure below would be meaningless.
+
 **What replicas are for.**
 - **Backfill reads (milestone 6).** Copying whole tables loads the database, so it can run on a replica. The slot's exported snapshot only exists on the main instance, so a replica cannot use it. The safe procedure is:
   1. create the slot on the main instance and note its `consistent_point` LSN,
-  2. wait until the replica has replayed past that LSN (`pg_last_wal_replay_lsn() >= consistent_point`),
+  2. wait until the replica has replayed past that LSN (`pg_last_wal_replay_lsn() >= consistent_point`; the LSNs are only comparable because preflight checked the `system_identifier`),
   3. copy the tables in a `REPEATABLE READ` transaction on the replica,
   4. stream from `consistent_point`.
 
@@ -187,19 +192,28 @@ Rules that the implementation (`pgsync/source.go`) follows:
 
 **Requirements for replicas:** physical streaming replication from the main instance, `hot_standby = on`, the same major version, and a role that can run `pg_is_in_recovery()` and `pg_last_wal_replay_lsn()`. `hot_standby_feedback = on` is recommended for long backfill reads, so replay conflicts do not cancel them.
 
-**Failover and promotion (not automated in v1).** If the main instance is lost and a replica is promoted, the logical slot is not on it (it is only carried over with PostgreSQL 17 failover slots). The operator points `postgres.dsn` at the new main instance, removes it from `replicas`, creates the slot and re-snapshots (milestone 6). If `dsn` points at a server that is in recovery, preflight fails with a clear error instead of trying to stream from it.
+**Failover and promotion (not automated in v1).** If the main instance is lost and a replica is promoted, the logical slot is not on it (it is only carried over with PostgreSQL 17 failover slots). The operator points `postgres.dsn` at the new main instance, removes it from `replicas`, creates the slot and re-snapshots (milestone 6). The rebuild clears the keys the sync owns and the old checkpoint (3.5), so LSNs of the new main instance are never compared with a position recorded on the old one. If you skip the rebuild, the checkpoint's cluster identity no longer matches and the sync halts (3.3). If `dsn` points at a server that is in recovery, preflight fails with a clear error instead of trying to stream from it.
 
 ### 2.4 Redis side
 
 **Keys.** One PostgreSQL row = one Redis key. The key comes from a per-table template built from primary-key (replica-identity) columns:
 
 ```
-{key_prefix}{schema}.{table}:{pk}            default  →  sync:public.users:42
+{key_prefix}{schema}.{table}:{pk}            default  →  sync:pgredissync:public.users:42
 user:{id}                                    custom template
 tenant:{tenant_id}:order:{id}                composite key
 ```
 
 Rules: placeholders must be replica-identity columns (checked in preflight, because deletes only carry those). Values are escaped (`:` and `%` are percent-encoded) so a key cannot collide with another.
+
+**Key ownership.** The sync owns every key under a table's **key prefix**: the literal text of its template before the first placeholder (for `user:{id}` that is `user:`). `scan_delete` (TRUNCATE) and the rebuild (3.5) delete by that prefix, so it must be safe to delete. Preflight enforces:
+- The prefix is **not empty**. A template that starts with a placeholder (`{id}:x`) is rejected, because it would have to scan every key.
+- Prefixes are **unique per table** and **do not overlap**: no prefix may equal or start with another table's prefix. Otherwise deleting one table's keys would delete the other's.
+- A prefix does **not overlap the control keys** (`sync:{<slot>}:checkpoint` and `sync:{<slot>}:snapshot`).
+- The default `key_prefix` is `sync:<database>:`, so two databases that share one Redis (several processes, see 1) do not collide on `public.users`. A custom template needs its own namespace for the same reason.
+- Glob characters in a prefix (`*`, `?`, `[`, `]`, `\`) are escaped in the `SCAN MATCH` pattern.
+
+Nothing else may write under an owned prefix. Anything there is deleted by a TRUNCATE or a rebuild.
 
 **Value types** (per table, `type:`):
 
@@ -227,9 +241,9 @@ Details that matter:
 - **Value encoding.** `hash`: PostgreSQL text form of the value, except `bool` → `true`/`false` and `bytea` → base64. `json`: `bool` → bool, integer and float → number, `numeric` and `int8` → string by default (no precision loss), `json/jsonb` → embedded, timestamps → RFC 3339 string, everything else → string. Mapping is by type OID.
 - **Column filter/rename.** `include_columns`, `exclude_columns` (e.g. drop `password_hash`), `rename`.
 - **TTL.** Optional `ttl` per table, applied with `EXPIRE` after each write.
-- **TRUNCATE.** `on_truncate: scan_delete` (default: `SCAN` the table's key prefix and `UNLINK`, which is O(keys)), `ignore`, or `fail`. Honest cost: truncating a big table is slow on the Redis side.
+- **TRUNCATE.** `on_truncate: scan_delete` (default: `SCAN` the table's key prefix, see key ownership above, and `UNLINK`, which is O(keys)), `ignore`, or `fail`. Honest cost: truncating a big table is slow on the Redis side.
 - **DDL tolerance.** pgoutput sends a fresh `Relation` message whenever a table's shape changes. We refresh our cache from it. An *added column* then just shows up as a new hash field. A changed primary key or an incompatible type change **halts** the consumer with a clear error instead of guessing.
-- **Checkpoint key.** `sync:{<slot>}:checkpoint` (a hash with `lsn` and `updated_at`), written inside the same `MULTI` as the data (see 3.2).
+- **Checkpoint key.** `sync:{<slot>}:checkpoint` (a hash with `lsn`, `system_id`, `timeline`, `epoch` and `updated_at`), written inside the same `MULTI` as the data (see 3.2). `epoch` is the write fence (3.2). `system_id` and `timeline` come from `IDENTIFY_SYSTEM` on the replication connection. They bind the checkpoint to one PostgreSQL cluster: an LSN is only comparable with another LSN from the same cluster and timeline (see 3.3).
 
 ---
 
@@ -275,7 +289,7 @@ Details that matter:
 | **Change decoder** | Turns raw `pgoutput` messages into typed `Change` values. Keeps the relation cache (OID → table, columns, key columns). Handles unchanged-TOAST markers and type OIDs. Marks transaction boundaries. Pure logic, no I/O. |
 | **Applier** | Groups changes into batches (by count, bytes or time), calls the sink, retries on error, then advances `flushedLSN`. This is the only place that decides when it is safe to ack. |
 | **Redis sink** | Maps each `Change` to Redis commands (`Mapper`), runs them as one `MULTI/EXEC` pipeline together with the checkpoint write. |
-| **Checkpoint store** | Records the last fully applied commit LSN. Default implementation lives in Redis (atomic with the data). Read once at startup. |
+| **Checkpoint store** | Records the last fully applied commit LSN (or the WAL end after an idle advance), plus the cluster's system identifier and timeline. Default implementation lives in Redis (atomic with the data). Read once at startup. |
 | **Status** | A snapshot of the pipeline state, returned by `Syncer.Status()` and used by `/healthz` (fields in 4.2): connected or not, last received and last applied LSN, pending changes, snapshot running, last error. Read-only, no I/O. |
 | **Source selector** | Decides which PostgreSQL server each connection goes to, from the configured topology (2.3). `StreamDSN` always returns the main instance. `SelectReadSource` returns the first healthy replica (or the main instance) for read-only queries. In `single` it just returns the one instance. Implemented in `pgsync/source.go`. |
 
@@ -287,15 +301,24 @@ Details that matter:
 
 ```
 receive txn ──▶ decode ──▶ Applier.collect ──▶ Sink.Apply(batch):
+                                                 WATCH checkpoint; HMGET epoch, lsn    (fence check)
                                                  MULTI
                                                    <mapped Redis commands>
                                                    HSET checkpoint lsn=<commitEndLSN>   (only on txn-final batch)
                                                  EXEC
+                                                 WAITAOF 1 <n> <timeout>               (only on txn-final batch)
                                              ──▶ flushedLSN = commitEndLSN
                                              ──▶ receiver sends Standby Status Update
 ```
 
-Order matters: **Redis commit first, Postgres ack second.** If we crash between the two, Postgres re-sends and we skip or re-apply harmlessly (3.3). The reverse order could lose data.
+Order matters: **Redis commit first, made durable, Postgres ack second.** If we crash between the two, Postgres re-sends and we skip or re-apply harmlessly (3.3). The reverse order could lose data.
+
+**Durability before ack.** `EXEC` only means that Redis applied the commands in memory. Once we ack, Postgres releases the WAL, so a Redis crash that loses the last second of an `appendfsync everysec` AOF (the compose default), or a Sentinel failover to a replica that has not received the write, would lose acknowledged data and force a rebuild (3.3). So a batch that carries a checkpoint, and an idle-advance checkpoint write, are followed by `WAITAOF 1 <n> <timeout>` on the same connection, with `n` = `redis.durability_replicas`. Only when the reply shows at least 1 local fsync and `n` replica fsyncs do we set `flushedLSN`. A short reply or a timeout is transient: do not ack, retry the same batch (idempotent). Batches without a checkpoint do not wait, because nothing is acked for them. `WAITAOF` needs Redis 7.2 or later with `appendonly yes`; preflight checks both, and `redis.durability: none` skips the wait (the previous behaviour, for managed Redis without `WAITAOF`, at the risk above).
+
+**Write fence.** One consumer holds the slot, but an old instance can outlive its PostgreSQL connection (cut off from PostgreSQL, still connected to Redis) and write a late batch. An unconditional checkpoint write would let it replay older transactions over newer state and move the checkpoint backwards. So:
+- **Epoch.** After a consumer gets the slot and before it loads the checkpoint, it runs `HINCRBY sync:{<slot>}:checkpoint epoch 1` and remembers the result.
+- **Check on every batch.** The sink does `WATCH` on the checkpoint key and reads `epoch` and `lsn`. It continues only if `epoch` is its own and `lsn` is below the batch's first commit LSN (the same rule as the skip rule in 3.3), so the checkpoint never moves backwards. Then `MULTI … EXEC`. If `EXEC` returns nil, the key changed after the `WATCH`: re-read and check again.
+- **A failed check is permanent.** The batch is not applied or acked and the instance halts as "fenced". The new owner carries on. The cost is one extra round trip per batch.
 
 ### 3.3 Delivery guarantee
 
@@ -307,7 +330,7 @@ How the three layers work together:
 
 1. **At-least-once.** We ack Postgres only after Redis commits. Any crash replays from the last ack.
 2. **Idempotent writes.** `HSET`, `SET`, `DEL` of full row state are safe to repeat. Replaying a transaction gives the same Redis state as applying it once. No counters, no appends.
-3. **Atomic checkpoint (standalone/Sentinel Redis).** The checkpoint is written in the same `MULTI` as the data. After a restart we load it and **skip any transaction with commit LSN ≤ checkpoint**. So the common crash case (applied but not acked) causes no replay at all. Redis then sees each transaction once, in effect.
+3. **Atomic checkpoint (standalone/Sentinel Redis).** The checkpoint is written in the same `MULTI` as the data. After a restart we load it and **skip any transaction with commit LSN ≤ checkpoint**, but only if the stored `system_id` and `timeline` equal the ones the server reports now. On a mismatch we do not compare LSNs at all (see the matrix below). The checkpoint only moves forward, and only for the current epoch (write fence, 3.2). So the common crash case (applied but not acked) causes no replay at all. Redis then sees each transaction once, in effect.
 
 Failure matrix:
 
@@ -316,7 +339,10 @@ Failure matrix:
 | Before Redis `EXEC` | Replay from last ack. Applied once. |
 | After `EXEC`, before Postgres ack | Replay is skipped by the checkpoint. |
 | Redis unreachable | Retry the same batch with backoff. Receiver keeps heartbeating. |
-| Redis checkpoint is **behind** the slot's `confirmed_flush_lsn` | Redis lost acknowledged data (failover, flush, restore of an old backup). **Gap detected: halt** (`on_gap: fail`). Fix = snapshot rebuild (milestone 6). |
+| Redis checkpoint is **behind** the slot's `confirmed_flush_lsn` | Redis lost acknowledged data (failover, flush, restore of an old backup, or a durability gap if `redis.durability: none`). **Gap detected: halt** (`on_gap: fail`). Fix = snapshot rebuild (milestone 6). |
+| Checkpoint's `system_id` or `timeline` differs from the server's (slot re-created on a new cluster, restore, `pg_upgrade`, promoted replica) | LSNs from the two clusters cannot be compared, and "skip if ≤ checkpoint" could silently drop new transactions. **Halt** (permanent, `on_gap` does not apply). Fix = snapshot rebuild, which clears the old checkpoint (3.5). |
+| `EXEC` succeeds, but `WAITAOF` shows the write is not durable (short reply or timeout) | Not acked. Transient: retry the same batch and wait again (3.2). |
+| Epoch in Redis is not ours, or `lsn` is not below the batch's first commit LSN (an old instance still writing) | The batch is not applied. **Halt** this instance as "fenced" (permanent). The new owner is unaffected (3.2). |
 | `EXEC` succeeds but a command inside it fails (`WRONGTYPE`) | Not acked, **halt** (permanent). Partial effects stay in Redis and are fixed by the next successful replay of the same batch, once the cause (a foreign key type, memory) is fixed. |
 | Large transaction split over batches, crash in the middle | The whole transaction is replayed. Safe because writes are idempotent. |
 
@@ -340,6 +366,7 @@ An empty Redis needs the existing rows, not only future changes. Reading all row
 Rules:
 - **A snapshot row never overwrites a newer change.** On the main instance the snapshot is exactly the state at `consistent_point`, so replay is clean. On a replica it may be newer; the 2.3 caveat applies.
 - **Crash during the copy restarts the copy.** The exported snapshot lives only as long as the connection that created the slot, so it cannot be resumed. On restart the slot is dropped and re-created.
+- **A rebuild starts clean.** The order is: set the marker to `in_progress`, delete the keys the sync owns (the same per-table key prefixes that `scan_delete` uses, see key ownership in 2.4, via `SCAN` and `UNLINK`), reset the checkpoint (`lsn`, `system_id` and `timeline`; the `epoch` stays, so an old writer stays fenced), then create the slot and copy. A rebuild therefore never resumes from a stale position or keeps keys of rows that no longer exist. The new checkpoint (the `consistent_point`, with the current `system_id` and `timeline`) is written in the same `MULTI` that sets the marker to `done`. A crash anywhere before that leaves `in_progress`, so streaming stays refused and the rebuild runs again.
 - **Snapshot marker.** Redis holds `sync:{<slot>}:snapshot` (`in_progress` or `done`). While it says `in_progress`, streaming is refused. Otherwise a half-filled Redis would be followed by a checkpoint that claims it is current.
 - **Progress** is reported through `Status.SnapshotRunning` and a rows-copied counter.
 
@@ -413,8 +440,11 @@ type Stream interface {
 }
 
 type Preflight interface {
-    // wal_level, slot, publication, replica identity, key templates; the main
-    // instance is not in recovery; with primary_replica, each replica is a standby.
+    // wal_level, slot, publication, replica identity, key templates (non-empty,
+    // unique, non-overlapping prefixes, see 2.4); the main instance is not in
+    // recovery; with primary_replica, each replica is a standby of the same
+    // cluster (same system_identifier); Redis 7.2+ with appendonly yes unless
+    // redis.durability is none.
     Check(ctx context.Context) error
 }
 ```
@@ -430,6 +460,9 @@ func (p Postgres) SelectReadSource(ctx context.Context, pr Prober) (ReadSource, 
 // tests use a fake, so selection logic needs no database. SelectReadSource gives
 // each call its own timeout (5 s) through ctx, so an implementation must honour ctx.
 // It must never return a negative LagBytes.
+// Known gap: ProbeReplica gets no main-instance position, so it cannot compute
+// the true lag (see "How lag is measured" in 2.3). The milestone 1 signature adds
+// the main's current WAL position, which the caller reads once per selection.
 type Prober interface {
     ProbeReplica(ctx context.Context, dsn string) (ReplicaStatus, error)
 }
@@ -461,7 +494,9 @@ type Mapper interface {
 }
 
 type CheckpointStore interface {
-    Load(ctx context.Context) (change.LSN, error) // 0 if none
+    // Load returns 0 if none. It also returns a permanent error if the stored
+    // system_id or timeline differs from the server's (see 3.3).
+    Load(ctx context.Context) (change.LSN, error)
     // Saving is part of Sink.Apply (same MULTI), so there is no separate Save.
 }
 ```
@@ -511,6 +546,8 @@ redis:
   password: ${REDIS_PASSWORD}
   db: 0
   checkpoint_key: "sync:{pg_redis_sync}:checkpoint"
+  durability: aof                # aof | none. aof = WAITAOF before every ack (3.2). none = ack after EXEC only
+  durability_replicas: 0         # replicas that must also fsync before ack; 1 with Sentinel (needs Redis 7.2+)
 sync:
   batch_max_changes: 500
   batch_max_bytes: 4MiB
@@ -529,7 +566,7 @@ retry:
 tables:
   - name: public.users
     type: hash
-    key: "user:{id}"             # default: sync:public.users:{pk}
+    key: "user:{id}"             # default: sync:<database>:public.users:{pk}
     exclude_columns: [password_hash]
     ttl: 0
     on_truncate: scan_delete     # scan_delete | ignore | fail
@@ -568,6 +605,10 @@ Existing single-instance setups need no change: `PG_DSN` and `REDIS_ADDR` alone 
 | Redis `OOM` | transient but flagged | Retry, log loudly, expose a metric. Needs an operator. |
 | Unknown relation, undecodable tuple, unsupported type | permanent | Halt. Return an error from `Run`. Process exits non-zero. |
 | Key template references non-identity column; PK change in `Relation` | permanent | Halt (also caught in preflight where possible). |
+| Key prefix empty, duplicated, overlapping another table's prefix or the control keys | permanent | Preflight error naming both tables (2.4). |
+| Another instance holds a newer epoch, or the checkpoint `lsn` is not below the batch (fenced) | permanent | Halt without applying or acking (3.2). |
+| `WAITAOF` reply shows too few fsyncs, or times out | transient | Do not ack. Retry the same batch (3.2). |
+| A replica's `system_identifier` differs from the main's | permanent | Preflight error (2.3). Never used for reads. |
 | Redis checkpoint behind slot position | permanent | Halt (`on_gap: fail`). |
 | `dsn` points at a server in recovery (a replica, or a failed-over main) | permanent | Halt in preflight with a clear error. Never stream from it. |
 | A replica is down, lagging or not a standby | transient | Not an error. Skip it and use the next one, then the main instance (`read_fallback`). Only `read_fallback: none` turns this into an error (`ErrNoReadSource`). The CDC stream is unaffected, because it never uses a replica. |
