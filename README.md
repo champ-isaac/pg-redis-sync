@@ -13,6 +13,7 @@ Ships as a Go library (`pgsync`) and a ready-to-run binary (`cmd/pg-redis-sync`)
 4. [Implementation](#4-implementation)
 5. [Milestones](#5-milestones)
 6. [Open questions](#6-open-questions)
+7. [Prior art and alternatives considered](#7-prior-art-and-alternatives-considered)
 
 ---
 
@@ -30,7 +31,7 @@ Further assumptions I made (please confirm or correct):
 
 - **PostgreSQL 13+** (14+ recommended), built-in `pgoutput` plugin. Not `wal2json`/`decoderbufs`, because `pgoutput` needs no server extension and is available on every managed service.
 - **Redis standalone or Sentinel** in v1. Redis Cluster is deferred (see 2.3: the atomic checkpoint needs all keys in one transaction).
-- **Go 1.23+**, `jackc/pgx/v5` + `jackc/pglogrepl` for replication, `redis/go-redis/v9` for Redis, stdlib `log/slog` for logs.
+- **Go 1.26** (as in `go.mod`, the `Dockerfile` and CI). Planned dependencies: `jackc/pgx/v5` + `jackc/pglogrepl` for replication (we do not write our own replication protocol), `redis/go-redis/v9` for Redis, `gopkg.in/yaml.v3` for the binary's config (its `KnownFields(true)` makes unknown keys an error), `prometheus/client_golang` in `cmd/` only, `testcontainers-go` for integration tests, stdlib `log/slog` for logs. The `pgsync` package stays dependency-free until milestone 1. No config framework (such as koanf): YAML plus environment variables is enough.
 - **Module path** is `github.com/champ-isaac/pg-redis-sync`, matching the git remote.
 - **Local dev credentials** (docker-compose only, not secrets): Postgres user `sync`, database `pgredissync`.
 - **Redis is a cache/derived view.** Postgres stays the source of truth. If Redis loses data, we rebuild it from a snapshot (milestone 6).
@@ -55,6 +56,8 @@ docker compose run --rm app go test ./... # app runs with PG_TOPOLOGY=primary_re
 docker compose down                       # add -v to also delete the volumes
 unset COMPOSE_FILE                        # back to the single-instance setup
 ```
+
+The replica's healthcheck passes only while its WAL receiver is streaming from the main instance (`pg_stat_wal_receiver.status = 'streaming'`), so `up --wait` fails, and the container shows unhealthy, if replication is broken.
 
 In both setups `postgres` is the main instance and holds the slot. The `app` container gets `PG_DSN` and `REDIS_ADDR`; with the replica file it also gets `PG_TOPOLOGY` and `PG_REPLICA_DSNS`. Ports on `127.0.0.1`: Postgres `5432`, Redis `6379`, replica `5433`. Override with `PG_PORT`, `REDIS_PORT`, `PG_REPLICA_PORT` if they are taken.
 
@@ -163,6 +166,12 @@ The `single` topology is exactly the behaviour from before topologies existed: w
 
 If none qualifies: `read_fallback: primary` (default) reads from the main instance, `read_fallback: none` returns an error (`ErrNoReadSource`). The reasons replicas were skipped are returned so they can be logged. Selection is re-evaluated each time a read connection is needed, so a recovered replica is picked up again.
 
+Rules that the implementation (`pgsync/source.go`) follows:
+- **Per-probe timeout.** Each probe runs under its own timeout (5 s), derived from the caller's context, so one slow replica cannot stall selection. A probe that times out is an ordinary skipped replica. Worst case is the timeout times the number of replicas.
+- **Cancellation is not a replica problem.** If the caller's context is cancelled or expires, selection returns `ctx.Err()`. It does not skip the replica and does not fall back to the main instance.
+- **Errors are redacted.** The text of a probe error is stripped of the DSN and the password before it is stored in the skip reasons.
+- **Impossible values are bugs.** A prober that reports a negative lag makes selection fail with an error (not `ErrNoReadSource`); it is not treated as a skippable replica.
+
 **Config validation** (at startup, before any connection): `replicas` is only allowed with `primary_replica`, and is an error with `single` (it is never silently ignored). `primary_replica` needs at least one replica. Each replica must be a different instance than the main (`host:port`), use the same database name, and appear only once. `replica_max_lag_bytes` must be above 0.
 
 **What replicas are for.**
@@ -211,6 +220,7 @@ Rules: placeholders must be replica-identity columns (checked in preflight, beca
 
 Details that matter:
 
+- **`MULTI/EXEC` is atomic in isolation, not all-or-nothing.** Redis does not roll back. If `EXEC` succeeds but one command inside it fails (for example `WRONGTYPE`, because another writer put a string where we want a hash), the other commands still ran. The sink must inspect every command result in the reply. Such an error is **permanent** (see 4.4): retrying cannot fix it, and the checkpoint write in the same `MULTI` must not be treated as proof that the batch is correct.
 - **Updates are state-based, not delta-based.** We always write the new row state, never "increment" something. This is what makes replays safe.
 - **NULL.** A Redis hash cannot hold NULL. We omit the field and `HDEL` it when a column becomes NULL. JSON mode writes `null`.
 - **TOAST.** Postgres omits large unchanged columns in an UPDATE (marked "unchanged toast"). In `hash` mode we simply do not touch those fields, so it just works. In `json` mode we need the full row, so the table needs `REPLICA IDENTITY FULL` (the old tuple then supplies the missing values). Preflight rejects a `json` table without it.
@@ -266,6 +276,7 @@ Details that matter:
 | **Applier** | Groups changes into batches (by count, bytes or time), calls the sink, retries on error, then advances `flushedLSN`. This is the only place that decides when it is safe to ack. |
 | **Redis sink** | Maps each `Change` to Redis commands (`Mapper`), runs them as one `MULTI/EXEC` pipeline together with the checkpoint write. |
 | **Checkpoint store** | Records the last fully applied commit LSN. Default implementation lives in Redis (atomic with the data). Read once at startup. |
+| **Status** | A snapshot of the pipeline state, returned by `Syncer.Status()` and used by `/healthz` (fields in 4.2): connected or not, last received and last applied LSN, pending changes, snapshot running, last error. Read-only, no I/O. |
 | **Source selector** | Decides which PostgreSQL server each connection goes to, from the configured topology (2.3). `StreamDSN` always returns the main instance. `SelectReadSource` returns the first healthy replica (or the main instance) for read-only queries. In `single` it just returns the one instance. Implemented in `pgsync/source.go`. |
 
 **Concurrency model.** Two goroutines joined by a bounded channel: receiver/decoder → applier. When Redis is slow the channel fills, the decoder stops reading from the socket, and Postgres buffers WAL on its side. The receiver keeps sending keepalives the whole time, so a slow Redis never causes a replication timeout.
@@ -306,6 +317,7 @@ Failure matrix:
 | After `EXEC`, before Postgres ack | Replay is skipped by the checkpoint. |
 | Redis unreachable | Retry the same batch with backoff. Receiver keeps heartbeating. |
 | Redis checkpoint is **behind** the slot's `confirmed_flush_lsn` | Redis lost acknowledged data (failover, flush, restore of an old backup). **Gap detected: halt** (`on_gap: fail`). Fix = snapshot rebuild (milestone 6). |
+| `EXEC` succeeds but a command inside it fails (`WRONGTYPE`) | Not acked, **halt** (permanent). Partial effects stay in Redis and are fixed by the next successful replay of the same batch, once the cause (a foreign key type, memory) is fixed. |
 | Large transaction split over batches, crash in the middle | The whole transaction is replayed. Safe because writes are idempotent. |
 
 Known caveat of replay: if a crash forces a replay without the checkpoint (e.g. checkpoint store disabled), a key can briefly show an *older* value until the replay catches up. Final state is always correct. A per-key LSN guard (Lua compare-and-set) is a possible later option if this matters.
@@ -315,7 +327,21 @@ Consistency seen by Redis readers: **eventually consistent.** Changes from one t
 ### 3.4 Error classes (summary, details in 4.4)
 
 - **Transient** (network, Redis timeout/`LOADING`/`READONLY`, slot busy): retry with backoff, forever by default.
-- **Permanent** (undecodable message, unknown relation, config/key-template mismatch, incompatible schema change): halt and report. Skipping would silently lose data.
+- **Permanent** (undecodable message, unknown relation, config/key-template mismatch, incompatible schema change, a failed command inside `EXEC`): halt and report. Skipping would silently lose data.
+
+### 3.5 Initial load and rebuild (milestone 6)
+
+An empty Redis needs the existing rows, not only future changes. Reading all rows and then starting the stream loses changes made in between, so the order is fixed:
+
+1. Create the slot **with the replication-protocol command** `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput EXPORT_SNAPSHOT` (PostgreSQL 15 and later also accept `(SNAPSHOT 'export')`). This returns the slot's `consistent_point` and an exported snapshot. The SQL function `pg_create_logical_replication_slot()` cannot export a snapshot, so it is not used for this.
+2. Copy the tables in a `REPEATABLE READ` transaction that imports that snapshot (on a replica: the procedure in 2.3).
+3. Stream from `consistent_point`. Changes made during the copy arrive here, in commit order.
+
+Rules:
+- **A snapshot row never overwrites a newer change.** On the main instance the snapshot is exactly the state at `consistent_point`, so replay is clean. On a replica it may be newer; the 2.3 caveat applies.
+- **Crash during the copy restarts the copy.** The exported snapshot lives only as long as the connection that created the slot, so it cannot be resumed. On restart the slot is dropped and re-created.
+- **Snapshot marker.** Redis holds `sync:{<slot>}:snapshot` (`in_progress` or `done`). While it says `in_progress`, streaming is refused. Otherwise a half-filled Redis would be followed by a checkpoint that claims it is current.
+- **Progress** is reported through `Status.SnapshotRunning` and a rows-copied counter.
 
 ---
 
@@ -367,6 +393,8 @@ type Change struct {
     Unchanged []string       // names of columns that were left out as unchanged TOAST
     Types     map[string]uint32 // column → type OID, used for encoding
     CommitLSN LSN            // LSN of the transaction this change belongs to
+    XID       uint32         // PostgreSQL transaction id, for logs and tracing
+    CommitTime time.Time     // commit time on the main instance; gives end-to-end latency
 }
 
 type Batch struct {
@@ -399,7 +427,9 @@ func (p Postgres) StreamDSN() (string, error) // the main instance + replication
 func (p Postgres) SelectReadSource(ctx context.Context, pr Prober) (ReadSource, error)
 
 // Prober inspects one replica. A pgx implementation arrives with milestone 1;
-// tests use a fake, so selection logic needs no database.
+// tests use a fake, so selection logic needs no database. SelectReadSource gives
+// each call its own timeout (5 s) through ctx, so an implementation must honour ctx.
+// It must never return a negative LagBytes.
 type Prober interface {
     ProbeReplica(ctx context.Context, dsn string) (ReplicaStatus, error)
 }
@@ -442,7 +472,20 @@ type Syncer struct{ /* … */ }
 
 func New(cfg Config, opts ...Option) (*Syncer, error) // Options: WithLogger, WithMetrics, WithSink, WithMapper
 func (s *Syncer) Run(ctx context.Context) error       // blocks until ctx is cancelled or a permanent error
+func (s *Syncer) Status() Status                      // safe to call at any time, from any goroutine
+
+type Status struct {
+    Connected       bool      // replication connection is up
+    SnapshotRunning bool      // initial load in progress (milestone 6)
+    LastReceivedLSN change.LSN
+    LastAppliedLSN  change.LSN // = last LSN committed to Redis and eligible for ack
+    PendingChanges  int        // decoded but not yet applied
+    LastError       string     // last transient or permanent error text, redacted
+    Halted          bool
+}
 ```
+
+There is deliberately no separate `Start`/`Stop`/`Close`: `Run(ctx)` starts, cancelling `ctx` stops gracefully (4.4), and `Run` returns when everything is closed.
 
 `Metrics` is a small interface (counters, gauges, histograms). The binary plugs in Prometheus. The library defaults to a no-op, so it adds no hard dependency.
 
@@ -475,6 +518,8 @@ sync:
   queue_size: 4096               # decoder → applier channel, the backpressure limit
   standby_status_interval: 10s
   on_gap: fail                   # fail | ignore (never ignore in production)
+snapshot:
+  mode: never                    # never | initial (milestone 6). initial = load existing rows if Redis is empty
 retry:
   initial_backoff: 200ms
   max_backoff: 30s
@@ -496,7 +541,7 @@ http:
   addr: ":9090"                  # /healthz, /metrics
 ```
 
-Everything has a default except `postgres.dsn`, `redis.addr` and `tables`. With `topology: primary_replica`, `replicas` is also required. Config is validated at startup. Unknown fields are an error.
+Everything has a default except `postgres.dsn`, `redis.addr` and `tables`. With `topology: primary_replica`, `replicas` is also required. Config is validated at startup. Unknown fields are an error (`yaml.v3` with `KnownFields(true)`).
 
 **Environment variables** (what `pgsync.LoadFromEnv` reads today, before the YAML loader exists):
 
@@ -519,12 +564,15 @@ Existing single-instance setups need no change: `PG_DSN` and `REDIS_ADDR` alone 
 | Replication connection lost | transient | Reconnect with backoff, `START_REPLICATION` again from the slot position. In-flight, unacked work is replayed (safe). |
 | Slot already active (another instance) | transient | Retry with backoff. This is the standby behaviour. |
 | Redis timeout, connection reset, `LOADING`, `READONLY`, `TRYAGAIN`, `CLUSTERDOWN` | transient | Retry the **same batch** with exponential backoff and jitter. Replication keepalives continue. Reconnect the Redis client if needed. |
+| A command inside `EXEC` fails (`WRONGTYPE`, wrong arguments) | permanent | Halt without acking. Retrying cannot help. See 2.4. |
 | Redis `OOM` | transient but flagged | Retry, log loudly, expose a metric. Needs an operator. |
 | Unknown relation, undecodable tuple, unsupported type | permanent | Halt. Return an error from `Run`. Process exits non-zero. |
 | Key template references non-identity column; PK change in `Relation` | permanent | Halt (also caught in preflight where possible). |
 | Redis checkpoint behind slot position | permanent | Halt (`on_gap: fail`). |
 | `dsn` points at a server in recovery (a replica, or a failed-over main) | permanent | Halt in preflight with a clear error. Never stream from it. |
 | A replica is down, lagging or not a standby | transient | Not an error. Skip it and use the next one, then the main instance (`read_fallback`). Only `read_fallback: none` turns this into an error (`ErrNoReadSource`). The CDC stream is unaffected, because it never uses a replica. |
+| `ctx` cancelled during replica selection | shutdown | `SelectReadSource` returns `ctx.Err()`. No fallback to the main instance. |
+| A prober reports negative lag | permanent (bug) | `SelectReadSource` returns an error. Not treated as a skipped replica. |
 | `ctx` cancelled / SIGTERM | shutdown | Stop reading, finish and ack the in-flight batch (bounded by a shutdown timeout), close connections, return `nil`. |
 
 Principles:
@@ -533,12 +581,13 @@ Principles:
 - **Never ack before Redis commit.** This is enforced in one place (the applier).
 - **Never skip silently.** The only "skip" option (`skip_and_log`) is opt-in. A dead-letter sink is a later extension.
 - **Bounded memory.** Channel size and batch limits cap memory. Giant transactions are split into batches.
-- **Observable.** Metrics: `replication_lag_bytes` (server WAL end minus flushed LSN), `apply_latency_seconds`, `batch_size`, `changes_total{op,table}`, `retries_total{class}`, `last_ack_timestamp`, `halted`. `/healthz` is unhealthy when halted or when lag does not move for too long. Alert on lag: a stuck slot keeps WAL on the primary.
+- **Observable.** Metrics, all prefixed `pg_redis_sync_`: `replication_lag_bytes` (server WAL end minus flushed LSN), `slot_retained_wal_bytes` (WAL the main instance keeps for our slot, read from `pg_replication_slots`), `sync_latency_seconds` (commit time on the main instance to Redis commit, from `Change.CommitTime`), `batch_duration_seconds`, `batch_size`, `queue_size` (decoder to applier channel fill), `changes_total{op,table}`, `failed_changes_total`, `retries_total{class}`, `last_ack_timestamp`, `halted`. `/healthz` is unhealthy when halted or when lag does not move for too long. Alert on lag: a stuck slot keeps WAL on the primary.
 
 ### 4.5 Testing approach
 
 - **Unit:** decoder against recorded `pgoutput` byte fixtures (insert, update with key change, delete, TOAST, truncate, relation change). Mapper as table-driven tests (Change in, commands out). Applier with a fake `Stream` and fake `Sink` (retry, ack order).
 - **Integration:** real Postgres + Redis via docker-compose / testcontainers. Check end-to-end content equality after random workloads. Run the suite against **both** topologies: `docker-compose.yaml` alone (single) and with `docker-compose.replica.yaml` (main plus replica). In the replica run, also stop the replica mid-test and check the sync keeps streaming from the main instance.
+- **Behaviour cases to cover** (each one a named integration test): insert, update and delete reach Redis; several updates in a row, the latest committed value wins; a primary-key change deletes the old key; the same change delivered twice leaves the same state; one large transaction; Redis slow, so the queue fills and memory stays bounded; Redis down, so nothing is acked and the batch is retried; an initial load while rows are being updated ends with no lost or stale value; a `WRONGTYPE` key halts the sync without acking.
 - **Fault injection:** kill the process after `EXEC` but before ack, and before `EXEC`. Drop the Redis connection mid-batch. Restart Postgres. After each, assert Redis equals Postgres and no data was lost.
 - **Soak:** sustained write load with periodic restarts, watching lag and memory.
 
@@ -556,7 +605,7 @@ Each milestone ends in something runnable and testable.
 | **3** | **Redis sink, hash mode.** Mapper, `MULTI/EXEC` batches, atomic checkpoint, key templates, delete/update/key-change, TRUNCATE. Applier with ack-after-commit. | End-to-end sync works. Content equality test passes under random workload. |
 | **4** | **Reliability.** Retry/backoff, reconnect, standby behaviour, graceful shutdown, gap detection, idle LSN advance. | Fault-injection suite passes (kill points, Redis/Postgres restarts). |
 | **5** | **Binary & operations.** YAML config, `slog`, Prometheus metrics, `/healthz`, Dockerfile, example config, user docs. | Runs from a container with only config + env. Lag and halt state visible in metrics. **v0.1.0 release.** |
-| **6** | **Rebuild & JSON mode.** Initial snapshot/backfill. `single`: create slot with `EXPORT_SNAPSHOT`, copy tables in a `REPEATABLE READ` transaction using that snapshot, then stream from the slot's consistent point. `primary_replica`: copy from a replica after it has replayed past the slot's consistent point (2.3). Add `json` value type. | Empty Redis can be rebuilt from Postgres with no gap and no duplicates. Used also to recover from a detected gap. |
+| **6** | **Rebuild & JSON mode.** Initial snapshot/backfill. `single`: create slot with `EXPORT_SNAPSHOT`, copy tables in a `REPEATABLE READ` transaction using that snapshot, then stream from the slot's consistent point. `primary_replica`: copy from a replica after it has replayed past the slot's consistent point (2.3). Add `json` value type. Details in 3.5 (protocol-command slot creation, snapshot marker, restart on crash). | Empty Redis can be rebuilt from Postgres with no gap and no duplicates, also when the process is killed mid-copy. Used also to recover from a detected gap. |
 | **7** | **Later, only if needed.** `pgoutput` v2 streaming of in-progress large transactions, parallel apply by key hash with a low-watermark ack, Redis Cluster, dead-letter sink, per-key LSN guard, Redis Streams sink, CDC from a standby (PostgreSQL 16+, opt-in `stream_from: replica`), automated failover handling. | Each item is justified by a measured need first. |
 
 ---
@@ -569,3 +618,26 @@ Each milestone ends in something runnable and testable.
 4. Are the tables you sync all primary-keyed? Tables with no PK need `REPLICA IDENTITY FULL` or a unique index.
 5. Do you need an initial load on day one? If yes, milestone 6 moves earlier.
 6. What is your end-to-end latency target and peak write rate? This sets batch defaults and decides whether parallel apply (milestone 7) is ever needed.
+
+---
+
+## 7. Prior art and alternatives considered
+
+**Prior art to study before milestone 1.**
+- `github.com/Trendyol/go-pq-cdc-redis` (checked on its GitHub page): the closest existing project. It streams PostgreSQL changes to Redis with `pgoutput`, runs an initial load before CDC, supports `string`, `json` and `hash` values, standalone, Sentinel and Cluster Redis, flushes batches through Redis pipelines by size and timer, and acknowledges only the last LSN after a successful pipeline run (at-least-once). Our difference: the checkpoint is written in the same `MULTI` as the data and compared with the slot at start (gap detection), the topologies are explicit, and the sink is a neutral interface. Its license is not stated on that page, so read its code for ideas only until that is checked.
+- `jackc/pglogrepl` and `jackc/pgx`: the replication protocol and driver we build on.
+- Debezium's PostgreSQL connector: the reference for consistent snapshots followed by streaming (3.5).
+
+**Alternatives considered, from an outside design review, and what we did.**
+
+| Suggestion | Decision | Why |
+|---|---|---|
+| Treat the PostgreSQL slot as the only checkpoint; keep a Redis checkpoint only as extra state | **Keep both, with roles.** The slot is what PostgreSQL resumes from. The Redis checkpoint is written atomically with the data, so it removes most replays and detects data lost in Redis (3.3). | A slot position alone cannot tell us that Redis lost data. |
+| A `Transaction` envelope holding all events of a transaction | **Not adopted.** `Change` carries `CommitLSN`, `XID` and `CommitTime`, and `Batch.Checkpoint` marks the end of a transaction. | A whole-transaction value forces the full transaction into memory. Batches can split large ones. |
+| `Transformer` turning events into Redis commands, `Sink.Apply(commands)` | **Not adopted.** `Mapper` lives in `sink/redis`, so `change/` and the decoder never know Redis. | Keeps the CDC side free of Redis types and allows other sinks. |
+| `Pipeline()` for batches | **Use `MULTI/EXEC`** and check every command result (2.4). | A plain pipeline is not atomic, and the checkpoint must be atomic with the data. |
+| Public packages `config`, `cdc`, `event`, `snapshot`, `processor`, `redis`, `checkpoint`, `engine`, `metrics` | **Not adopted.** Three public packages (`pgsync`, `change`, `sink/redis`) plus the binary, the rest `internal/` (4.1). | Fewer public promises to keep stable. |
+| `Start`, `Stop`, `Close`, `Health` on the engine | **Adopted in part:** `Run(ctx)` and `Status()`. | `Run` with a context is the usual Go shape. `Status()` covers health. |
+| Create the slot with `pg_create_logical_replication_slot()` | **Not for the initial load.** Use `CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT` (3.5). | The SQL function cannot export a snapshot. |
+| koanf for configuration | **Not adopted.** `yaml.v3` plus environment variables. | One small dependency instead of a framework. |
+| Status struct, latency and buffer metrics, `Before`/`After` full rows | **Status, latency, queue and slot-retention metrics adopted.** Full `Before` row not added. | `OldKey` is enough for deletes and key changes. A full old row is needed only with `REPLICA IDENTITY FULL`, and no mapping uses it. |
