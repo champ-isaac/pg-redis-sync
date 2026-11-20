@@ -11,7 +11,7 @@ env:
   GO_VERSION: '1.26'
 
 jobs:
-  # Code quality and unit tests (coverage >= 90%): checks.yml.
+  # Code quality, unit tests (coverage >= 90%) and the secret scan: checks.yml.
   checks:
     uses: ./.github/workflows/checks.yml
 

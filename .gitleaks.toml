@@ -1,0 +1,22 @@
+# Used by the "Secret scan" job in .github/workflows/ci.yml.
+title = "pg-redis-sync gitleaks config"
+
+[extend]
+# Keep every built-in rule (private keys, cloud and API keys, tokens, ...).
+useDefault = true
+
+# The built-in rules do not catch a password written into a connection URL,
+# which is how this project passes its DSNs.
+[[rules]]
+id = "url-credentials"
+description = "Password in a connection URL (scheme://user:password@host)"
+regex = '''[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@'"]+:([^\s:/@'"${}<>]{4,})@[^\s/@'"]+'''
+secretGroup = 1
+keywords = ["://"]
+
+  # Only the documented local-dev password and obvious placeholders are allowed.
+  # Anything else in a URL fails the scan.
+  [[rules.allowlists]]
+  description = "docker-compose dev password, test fixtures and doc placeholders"
+  regexTarget = "secret"
+  regexes = ['''^(sync_local_only|s3cret[0-9]*|pass|password|xxxxx)$''']

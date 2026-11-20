@@ -92,3 +92,37 @@ jobs:
             echo "::error::Coverage ${total}% is below the ${COVERAGE_MIN}% minimum."
             exit 1
           fi
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    env:
+      BEFORE: ${{ github.event.before }}
+      PR_BASE: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the scan walks commits, so it needs the history
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      # Rules: .gitleaks.toml (all built-in rules plus passwords in URLs).
+      - name: Scan the commits of this push or pull request
+        run: |
+          set -euo pipefail
+          zeros=0000000000000000000000000000000000000000
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            range="${PR_BASE}..${PR_HEAD}"
+          elif [[ "$GITHUB_REF" == refs/heads/feature/* ]]; then
+            git rev-parse --verify -q origin/develop >/dev/null || { echo "::error::origin/develop does not exist"; exit 1; }
+            range="origin/develop..${GITHUB_SHA}"
+          elif [ "$BEFORE" != "$zeros" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            range="${BEFORE}..${GITHUB_SHA}"
+          else
+            range="${GITHUB_SHA}" # new branch or unknown base: scan its whole history
+          fi
+          echo "Scanning commit range: ${range}"
+          "$(go env GOPATH)/bin/gitleaks" git --log-opts="${range}" --redact --no-banner --verbose --exit-code 1 .
