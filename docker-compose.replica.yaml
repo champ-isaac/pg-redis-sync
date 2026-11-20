@@ -46,8 +46,8 @@ services:
         fi
         exec postgres -c hot_standby=on -c hot_standby_feedback=on
     healthcheck:
-      # Accepts connections and really is a standby.
-      test: ["CMD-SHELL", "psql -Atc 'select pg_is_in_recovery()' | grep -qx t"]
+      # Healthy only while the WAL receiver is streaming from the main instance.
+      test: ["CMD-SHELL", "psql -Atc \"select count(*) from pg_stat_wal_receiver where status = 'streaming'\" | grep -qx 1"]
       interval: 5s
       timeout: 3s
       retries: 20
