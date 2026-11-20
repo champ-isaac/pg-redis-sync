@@ -31,3 +31,67 @@ jobs:
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
           gosec ./...
+
+  # Runs only for pushes to feature/*, and only when code quality, unit tests
+  # (with the 90% coverage gate) and the secret scan all passed. Opens a PR into
+  # develop, or refreshes the auto-generated part of the open one.
+  # Needs "Allow GitHub Actions to create and approve pull requests" to be on
+  # in the repo settings (Settings > Actions > General).
+  open-pr:
+    name: Open or update PR into develop
+    needs: checks
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feature/')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: open-pr-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Open or update the pull request
+        run: |
+          set -euo pipefail
+          if [ -z "$(git rev-list "origin/develop..HEAD" | head -1)" ]; then
+            echo "::notice::${BRANCH} has no commits ahead of develop; no PR needed."
+            exit 0
+          fi
+          {
+            echo "Checks passed on \`$(git rev-parse --short HEAD)\`: code quality (gofmt, go vet, golangci-lint), unit tests with coverage of at least 90%, and the secret scan. [Run](${RUN_URL})."
+            echo
+            echo "Commits:"
+            git log --format='- %h %s' "origin/develop..HEAD"
+          } > auto.md
+
+          number="$(gh pr list --head "$BRANCH" --base develop --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            # Replace only the part between the markers; keep anything a person wrote.
+            OLD="$(gh pr view "$number" --json body --jq .body)" python3 - <<'PY'
+          import os, re
+          block = "<!-- auto:start -->\n" + open("auto.md").read().strip() + "\n<!-- auto:end -->"
+          old = os.environ.get("OLD", "")
+          if "<!-- auto:start -->" in old:
+              new = re.sub(r"<!-- auto:start -->.*?<!-- auto:end -->", lambda m: block, old, flags=re.S)
+          else:
+              new = (old.rstrip() + "\n\n" if old.strip() else "") + block
+          open("body.md", "w").write(new)
+          PY
+            gh pr edit "$number" --body-file body.md
+            echo "Updated PR #${number}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            { echo "<!-- auto:start -->"; cat auto.md; echo "<!-- auto:end -->"; } > body.md
+            title="Feature: $(echo "${BRANCH#feature/}" | tr '_-' '  ')"
+            if ! url="$(gh pr create --base develop --head "$BRANCH" --title "$title" --body-file body.md)"; then
+              echo "::error::Could not create the PR. Check that Settings > Actions > General > 'Allow GitHub Actions to create and approve pull requests' is enabled."
+              exit 1
+            fi
+            echo "Opened ${url}" >> "$GITHUB_STEP_SUMMARY"
+          fi
