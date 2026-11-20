@@ -1,7 +1,7 @@
 name: Checks
 
-# Reusable checks, called by ci.yml (feature branches, pull requests).
-# They do not run on their own.
+# Reusable checks, called by ci.yml (feature branches, pull requests) and
+# release-gate.yml (master). They do not run on their own.
 on:
   workflow_call:
 
