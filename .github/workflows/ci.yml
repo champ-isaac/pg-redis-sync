@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches-ignore: [master] # master is covered by release-gate.yml
   pull_request:
 
 permissions:
@@ -11,91 +12,12 @@ env:
   GO_VERSION: '1.26'
 
 jobs:
-  # Gate: the repo has no Go code yet (see README milestone 0). Every job below
-  # is skipped, not failed, until go.mod and at least one .go file exist.
-  # Once the module is scaffolded, delete this job and the `needs`/`if` lines.
-  detect:
-    name: Detect Go code
-    runs-on: ubuntu-latest
-    outputs:
-      has_go: ${{ steps.detect.outputs.has_go }}
-    steps:
-      - uses: actions/checkout@v7
-      - id: detect
-        run: |
-          if [ -f go.mod ] && [ -n "$(find . -name '*.go' -not -path './.git/*' -print -quit)" ]; then
-            echo "has_go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_go=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No go.mod or .go files yet; Go jobs are skipped."
-          fi
-
-  lint:
-    name: Lint
-    needs: detect
-    if: needs.detect.outputs.has_go == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      # No .golangci.yml: the v2 default linters are errcheck, govet,
-      # ineffassign, staticcheck and unused. staticcheck is covered here.
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          version: latest
-
-  quality:
-    name: Code quality
-    needs: detect
-    if: needs.detect.outputs.has_go == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - name: go vet
-        run: go vet ./...
-      - name: gofmt
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "::error::These files are not gofmt-formatted:"
-            echo "$unformatted"
-            gofmt -d .
-            exit 1
-          fi
-
-  test:
-    name: Unit tests (coverage >= 90%)
-    needs: detect
-    if: needs.detect.outputs.has_go == 'true'
-    runs-on: ubuntu-latest
-    env:
-      COVERAGE_MIN: '90'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - name: Test
-        run: go test -race -coverprofile=coverage.out ./...
-      - name: Enforce coverage threshold
-        run: |
-          total="$(go tool cover -func=coverage.out | awk '/^total:/ { gsub("%", "", $3); print $3 }')"
-          echo "Total statement coverage: ${total}% (minimum ${COVERAGE_MIN}%)"
-          echo "Total statement coverage: **${total}%** (minimum ${COVERAGE_MIN}%)" >> "$GITHUB_STEP_SUMMARY"
-          if ! awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN { exit !(t + 0 >= m + 0) }'; then
-            echo "::error::Coverage ${total}% is below the ${COVERAGE_MIN}% minimum."
-            exit 1
-          fi
+  # Code quality, unit tests (coverage >= 90%) and the secret scan: checks.yml.
+  checks:
+    uses: ./.github/workflows/checks.yml
 
   security:
     name: Security
-    needs: detect
-    if: needs.detect.outputs.has_go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -110,3 +32,67 @@ jobs:
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
           gosec ./...
+
+  # Runs only for pushes to feature/*, and only when code quality, unit tests
+  # (with the 90% coverage gate) and the secret scan all passed. Opens a PR into
+  # develop, or refreshes the auto-generated part of the open one.
+  # Needs "Allow GitHub Actions to create and approve pull requests" to be on
+  # in the repo settings (Settings > Actions > General).
+  open-pr:
+    name: Open or update PR into develop
+    needs: checks
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feature/')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: open-pr-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Open or update the pull request
+        run: |
+          set -euo pipefail
+          if [ -z "$(git rev-list "origin/develop..HEAD" | head -1)" ]; then
+            echo "::notice::${BRANCH} has no commits ahead of develop; no PR needed."
+            exit 0
+          fi
+          {
+            echo "Checks passed on \`$(git rev-parse --short HEAD)\`: code quality (gofmt, go vet, golangci-lint), unit tests with coverage of at least 90%, and the secret scan. [Run](${RUN_URL})."
+            echo
+            echo "Commits:"
+            git log --format='- %h %s' "origin/develop..HEAD"
+          } > auto.md
+
+          number="$(gh pr list --head "$BRANCH" --base develop --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            # Replace only the part between the markers; keep anything a person wrote.
+            OLD="$(gh pr view "$number" --json body --jq .body)" python3 - <<'PY'
+          import os, re
+          block = "<!-- auto:start -->\n" + open("auto.md").read().strip() + "\n<!-- auto:end -->"
+          old = os.environ.get("OLD", "")
+          if "<!-- auto:start -->" in old:
+              new = re.sub(r"<!-- auto:start -->.*?<!-- auto:end -->", lambda m: block, old, flags=re.S)
+          else:
+              new = (old.rstrip() + "\n\n" if old.strip() else "") + block
+          open("body.md", "w").write(new)
+          PY
+            gh pr edit "$number" --body-file body.md
+            echo "Updated PR #${number}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            { echo "<!-- auto:start -->"; cat auto.md; echo "<!-- auto:end -->"; } > body.md
+            title="Feature: $(echo "${BRANCH#feature/}" | tr '_-' '  ')"
+            if ! url="$(gh pr create --base develop --head "$BRANCH" --title "$title" --body-file body.md)"; then
+              echo "::error::Could not create the PR. Check that Settings > Actions > General > 'Allow GitHub Actions to create and approve pull requests' is enabled."
+              exit 1
+            fi
+            echo "Opened ${url}" >> "$GITHUB_STEP_SUMMARY"
+          fi

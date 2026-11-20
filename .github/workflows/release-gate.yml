@@ -1,0 +1,62 @@
+name: Release gate
+
+# Runs when code is pushed to master. Every job below must pass before a
+# release is cut. There is no release or publish step here on purpose.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  # The same checks as the feature workflow (ci.yml): gofmt, go vet,
+  # golangci-lint, unit tests with coverage >= 90%, and the secret scan.
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  # Same job as `security` in ci.yml.
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec ./...
+
+  # Total statement coverage of ./pgsync/... must be exactly 100%.
+  coverage:
+    name: Coverage gate (100%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./pgsync/...
+      - name: Require 100% total statement coverage
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ { gsub("%", "", $3); print $3 }')"
+          # `go tool cover -func` rounds to one decimal, so 99.96% prints as 100.0%.
+          # Count profile blocks that never ran (last field 0) to stay exact.
+          missed="$(awk 'NR > 1 && $NF == 0 { n++ } END { print n + 0 }' coverage.out)"
+          echo "Total statement coverage: ${total}% (required 100%), uncovered blocks: ${missed}"
+          echo "Total statement coverage: **${total}%** (required 100%), uncovered blocks: ${missed}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$missed" != "0" ] || ! awk -v t="$total" 'BEGIN { exit !(t + 0 >= 100) }'; then
+            echo "::error::Coverage is ${total}% with ${missed} uncovered block(s); the release gate needs 100%."
+            go tool cover -func=coverage.out | awk '$NF != "100.0%"'
+            exit 1
+          fi

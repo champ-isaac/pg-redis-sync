@@ -1,0 +1,128 @@
+name: Checks
+
+# Reusable checks, called by ci.yml (feature branches, pull requests) and
+# release-gate.yml (master). They do not run on their own.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  # Gate: the repo has no Go code yet (see README milestone 0). Every job below
+  # is skipped, not failed, until go.mod and at least one .go file exist.
+  # Once the module is scaffolded, delete this job and the `needs`/`if` lines.
+  detect:
+    name: Detect Go code
+    runs-on: ubuntu-latest
+    outputs:
+      has_go: ${{ steps.detect.outputs.has_go }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: detect
+        run: |
+          if [ -f go.mod ] && [ -n "$(find . -name '*.go' -not -path './.git/*' -print -quit)" ]; then
+            echo "has_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_go=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No go.mod or .go files yet; Go jobs are skipped."
+          fi
+
+  lint:
+    name: Lint
+    needs: detect
+    if: needs.detect.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # No .golangci.yml: the v2 default linters are errcheck, govet,
+      # ineffassign, staticcheck and unused. staticcheck is covered here.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+  quality:
+    name: Code quality
+    needs: detect
+    if: needs.detect.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+  test:
+    name: Unit tests (coverage >= 90%)
+    needs: detect
+    if: needs.detect.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_MIN: '90'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Enforce coverage threshold
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ { gsub("%", "", $3); print $3 }')"
+          echo "Total statement coverage: ${total}% (minimum ${COVERAGE_MIN}%)"
+          echo "Total statement coverage: **${total}%** (minimum ${COVERAGE_MIN}%)" >> "$GITHUB_STEP_SUMMARY"
+          if ! awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN { exit !(t + 0 >= m + 0) }'; then
+            echo "::error::Coverage ${total}% is below the ${COVERAGE_MIN}% minimum."
+            exit 1
+          fi
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    env:
+      BEFORE: ${{ github.event.before }}
+      PR_BASE: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the scan walks commits, so it needs the history
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      # Rules: .gitleaks.toml (all built-in rules plus passwords in URLs).
+      - name: Scan the commits of this push or pull request
+        run: |
+          set -euo pipefail
+          zeros=0000000000000000000000000000000000000000
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            range="${PR_BASE}..${PR_HEAD}"
+          elif [[ "$GITHUB_REF" == refs/heads/feature/* ]]; then
+            git rev-parse --verify -q origin/develop >/dev/null || { echo "::error::origin/develop does not exist"; exit 1; }
+            range="origin/develop..${GITHUB_SHA}"
+          elif [ "$BEFORE" != "$zeros" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            range="${BEFORE}..${GITHUB_SHA}"
+          else
+            range="${GITHUB_SHA}" # new branch or unknown base: scan its whole history
+          fi
+          echo "Scanning commit range: ${range}"
+          "$(go env GOPATH)/bin/gitleaks" git --log-opts="${range}" --redact --no-banner --verbose --exit-code 1 .
