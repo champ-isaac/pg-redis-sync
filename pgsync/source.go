@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
+	"time"
 )
 
 // Source selection rules, the same in both topologies:
@@ -21,6 +23,10 @@ const (
 	RolePrimary Role = "primary"
 	RoleReplica Role = "replica"
 )
+
+// probeTimeout bounds each replica probe, so one slow replica cannot stall
+// source selection. A variable so tests can shorten it.
+var probeTimeout = 5 * time.Second
 
 // ErrNoReadSource means no replica qualified and fallback to the main instance
 // is switched off.
@@ -77,11 +83,20 @@ func (p Postgres) SelectReadSource(ctx context.Context, pr Prober) (ReadSource, 
 		if err := ctx.Err(); err != nil {
 			return ReadSource{}, err
 		}
-		st, err := pr.ProbeReplica(ctx, dsn)
+		pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+		st, err := pr.ProbeReplica(pctx, dsn)
+		cancel()
+		// A cancelled parent is not a replica problem: do not fall back to the main instance.
+		if cerr := ctx.Err(); cerr != nil {
+			return ReadSource{}, cerr
+		}
+		if err == nil && st.LagBytes < 0 {
+			return ReadSource{}, fmt.Errorf("replica[%d]: prober reported negative lag %d bytes", i, st.LagBytes)
+		}
 		reason := ""
 		switch {
 		case err != nil:
-			reason = "probe failed: " + err.Error()
+			reason = "probe failed: " + redactErr(err, dsn)
 		case !st.InRecovery:
 			reason = "not in recovery (not a standby)"
 		case st.LagBytes > p.MaxReplicaLagBytes:
@@ -97,4 +112,18 @@ func (p Postgres) SelectReadSource(ctx context.Context, pr Prober) (ReadSource, 
 		return ReadSource{}, fmt.Errorf("%w: %s", ErrNoReadSource, strings.Join(skipped, "; "))
 	}
 	return ReadSource{DSN: p.DSN, Role: RolePrimary, Skipped: skipped}, nil
+}
+
+// redactErr returns err's text with dsn and its password removed, because a
+// driver error may quote the connection string.
+func redactErr(err error, dsn string) string {
+	msg := strings.ReplaceAll(err.Error(), dsn, RedactDSN(dsn))
+	if u, perr := url.Parse(dsn); perr == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			for _, v := range []string{pw, url.PathEscape(pw), url.QueryEscape(pw)} {
+				msg = strings.ReplaceAll(msg, v, "xxxxx")
+			}
+		}
+	}
+	return msg
 }

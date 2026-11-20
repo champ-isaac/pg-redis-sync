@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeProber answers per DSN and records which DSNs were probed.
@@ -173,6 +174,98 @@ func TestSelectReadSourceErrors(t *testing.T) {
 	}
 	if len(pr.calls) != 0 {
 		t.Errorf("probed after cancellation: %v", pr.calls)
+	}
+}
+
+// ctxProber blocks until its context ends, then fails, like a slow or hung replica.
+// Replicas other than slowDSN answer healthy.
+type ctxProber struct {
+	slowDSN string
+	onBlock func() // runs once the probe is blocked; may cancel the parent
+}
+
+func (c *ctxProber) ProbeReplica(ctx context.Context, dsn string) (ReplicaStatus, error) {
+	if dsn != c.slowDSN {
+		return healthy(0), nil
+	}
+	if c.onBlock != nil {
+		c.onBlock()
+	}
+	<-ctx.Done()
+	return ReplicaStatus{}, ctx.Err()
+}
+
+func TestSelectReadSourceCancelDuringProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pr := &ctxProber{slowDSN: replicaDSN, onBlock: cancel}
+	got, err := replicaConfig("").SelectReadSource(ctx, pr) // default fallback is primary
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v (source %+v)", err, got)
+	}
+	if got.DSN != "" {
+		t.Errorf("fell back to %s after cancellation", got.DSN)
+	}
+}
+
+func TestSelectReadSourceProbeTimeout(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { probeTimeout = old })
+
+	// The first replica hangs; the parent context has no deadline.
+	pr := &ctxProber{slowDSN: replicaDSN}
+	start := time.Now()
+	got, err := replicaConfig("").SelectReadSource(context.Background(), pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Error("slow replica stalled selection")
+	}
+	if got.DSN != replica2DSN || got.Role != RoleReplica {
+		t.Errorf("want the second replica, got %+v", got)
+	}
+	assertContainsInOrder(t, strings.Join(got.Skipped, "\n"), []string{"replica[0]", "deadline exceeded"})
+}
+
+func TestSelectReadSourceProbeErrorIsRedacted(t *testing.T) {
+	// A driver error that quotes the whole DSN, and one that quotes only the password.
+	for name, errText := range map[string]string{
+		"full dsn": "dial failed for " + replicaDSN,
+		"password": "auth failed, password s3cret rejected",
+	} {
+		t.Run(name, func(t *testing.T) {
+			pr := &fakeProber{err: map[string]error{replicaDSN: errors.New(errText), replica2DSN: errors.New(errText)}}
+			got, err := replicaConfig("").SelectReadSource(context.Background(), pr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Skipped) == 0 {
+				t.Fatal("expected skipped replicas")
+			}
+			for _, s := range got.Skipped {
+				if strings.Contains(s, "s3cret") {
+					t.Errorf("skip reason leaks the password: %q", s)
+				}
+			}
+		})
+	}
+	// The error returned with fallback none carries the same text.
+	pr := &fakeProber{err: map[string]error{replicaDSN: errors.New("dial " + replicaDSN), replica2DSN: errors.New("x")}}
+	_, err := replicaConfig(FallbackNone).SelectReadSource(context.Background(), pr)
+	if err == nil || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("fallback none error leaks the password: %v", err)
+	}
+}
+
+func TestSelectReadSourceRejectsNegativeLag(t *testing.T) {
+	pr := &fakeProber{status: map[string]ReplicaStatus{replicaDSN: healthy(-1), replica2DSN: healthy(0)}}
+	got, err := replicaConfig("").SelectReadSource(context.Background(), pr)
+	if err == nil || !strings.Contains(err.Error(), "negative lag") {
+		t.Fatalf("want a negative lag error, got %v (source %+v)", err, got)
+	}
+	if len(pr.calls) != 1 {
+		t.Errorf("kept probing after invalid status: %v", pr.calls)
 	}
 }
 
